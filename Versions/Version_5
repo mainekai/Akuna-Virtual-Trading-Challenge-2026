@@ -1,0 +1,842 @@
+import math
+import random
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import Any, Final
+## Scores 11.4
+AJARAI_NAME: Final[str] = "AJR"
+AJARAI_UNDERLYING_ID: Final[int] = 2
+FED_FUNDS_RATE_NAME: Final[str] = "FED"
+FED_FUNDS_RATE_UNDERLYING_ID: Final[int] = 1
+RATE_STRIKE_GRID: Final[float] = 0.25
+THERIODIC_NAME: Final[str] = "THR"
+THERIODIC_UNDERLYING_ID: Final[int] = 3
+
+UNDERLYING_NAME_BY_ID: Final[dict[int, str]] = {
+    AJARAI_UNDERLYING_ID: AJARAI_NAME,
+    FED_FUNDS_RATE_UNDERLYING_ID: FED_FUNDS_RATE_NAME,
+    THERIODIC_UNDERLYING_ID: THERIODIC_NAME,
+}
+
+
+@dataclass(eq=True, frozen=True, unsafe_hash=True)
+class BinaryOption:
+    legs: "tuple[OptionLeg, ...]"
+    option_id: int
+    steps_until_expiry: int
+    strike: float
+
+    def __post_init__(self) -> None:
+        if self.steps_until_expiry < 0:
+            raise ValueError("Steps until expiry must be non-negative")
+
+        if not self.legs:
+            raise ValueError("Binary option must have at least one leg")
+
+        underlying_ids: list[int] = [leg.underlying_id for leg in self.legs]
+        if len(underlying_ids) != len(set(underlying_ids)):
+            raise ValueError("Binary option legs must reference distinct underlyings")
+
+        if any(leg.weight == 0 for leg in self.legs):
+            raise ValueError("Binary option leg weights must be non-zero")
+
+    def __str__(self) -> str:
+        terms: list[str] = []
+        for index, leg in enumerate(self.legs):
+            name: str = UNDERLYING_NAME_BY_ID.get(leg.underlying_id, str(leg.underlying_id))
+            magnitude: float = abs(leg.weight)
+            magnitude_str: str = "" if magnitude == 1 else f"{magnitude:.2f}*"
+            if index == 0:
+                sign: str = "-" if leg.weight < 0 else ""
+            else:
+                sign = " - " if leg.weight < 0 else " + "
+            terms.append(f"{sign}{magnitude_str}{name}")
+        observable_expression: str = "".join(terms)
+        return f"{self.option_id} ({self.steps_until_expiry}d {observable_expression} >= {self.strike:.2f})"
+
+    def advance_step(self) -> "BinaryOption":
+        if self.steps_until_expiry == 0:
+            return self
+
+        return replace(self, steps_until_expiry=self.steps_until_expiry - 1)
+
+    def contract_matches(self, other: "BinaryOption") -> bool:
+        return replace(other, option_id=self.option_id) == self
+
+    def expiry_valuation(self, value_by_underlying_id: dict[int, float]) -> float:
+        return 1.0 if self.observable_value(value_by_underlying_id) >= self.strike else 0.0
+
+    def observable_value(self, value_by_underlying_id: dict[int, float]) -> float:
+        return sum(leg.weight * value_by_underlying_id[leg.underlying_id] for leg in self.legs)
+
+
+@dataclass(frozen=True)
+class FokOrder:
+    counterparty_id: int
+    option_id: int
+    order_type: "OrderType"
+    price: float
+    quantity: int
+
+    def __post_init__(self) -> None:
+        if self.price < 0:
+            raise ValueError("FOK order price must be non-negative")
+
+        if self.quantity <= 0:
+            raise ValueError("FOK order quantity must be positive")
+
+
+@dataclass(frozen=True)
+class MarketHistory:
+    values_by_underlying_id: dict[int, tuple[float, ...]]
+
+    def __post_init__(self) -> None:
+        lengths: set[int] = {len(values) for values in self.values_by_underlying_id.values()}
+        if len(lengths) > 1:
+            raise ValueError("All underlyings must have the same number of historical days")
+
+        if lengths and next(iter(lengths)) <= 0:
+            raise ValueError("Market history must contain at least one day")
+
+    @property
+    def num_days(self) -> int:
+        if not self.values_by_underlying_id:
+            return 0
+        return len(next(iter(self.values_by_underlying_id.values())))
+
+
+@dataclass(frozen=True)
+class MarketParameters:
+    ajarai_drift: float
+    ajarai_idio_std_dev: float
+    ajarai_rate_beta: float
+    ajarai_sector_beta: float
+    rate_down_probability: float
+    rate_reversion_strength: float
+    rate_up_probability: float
+    sector_std_dev: float
+    theriodic_drift: float
+    theriodic_idio_std_dev: float
+    theriodic_rate_beta: float
+    theriodic_sector_beta: float
+
+    rate_step: float = 0.25
+    rate_target: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.rate_step <= 0:
+            raise ValueError("Rate step must be positive")
+
+        if self.rate_up_probability <= 0 or self.rate_down_probability <= 0:
+            raise ValueError("Rate up/down probabilities must both be positive")
+
+        if self.rate_up_probability + self.rate_down_probability > 1:
+            raise ValueError("Rate up/down probabilities must not sum to more than 1")
+
+        if self.rate_target < 0:
+            raise ValueError("Rate target must be non-negative")
+
+        if not (0 <= self.rate_reversion_strength <= 1):
+            raise ValueError("Rate reversion strength must be between 0 and 1")
+
+        if self.ajarai_idio_std_dev < 0 or self.theriodic_idio_std_dev < 0 or self.sector_std_dev < 0:
+            raise ValueError("Standard deviations must be non-negative")
+
+    def advance_company_value(
+        self,
+        current_value: float,
+        rate_change: float,
+        sector_shock: float,
+        *,
+        drift: float,
+        rate_beta: float,
+        sector_beta: float,
+        idio_std_dev: float,
+    ) -> float:
+        idiosyncratic_shock: float = random.gauss(mu=0.0, sigma=idio_std_dev)
+        log_return: float = drift + (rate_beta * rate_change) + (sector_beta * sector_shock) + idiosyncratic_shock
+        return round(current_value * math.exp(log_return), 2)
+
+    def advance_rate(self, rate_value: float) -> float:
+        up_probability, down_probability = self.tilted_rate_probabilities(rate_value)
+        draw: float = random.random()
+        if draw < up_probability:
+            return self.next_rate_value(rate_value, 1)
+
+        if draw < up_probability + down_probability:
+            return self.next_rate_value(rate_value, -1)
+
+        return rate_value
+
+    def advance_step(self, value_by_underlying_id: dict[int, float]) -> dict[int, float]:
+        current_rate_value: float = value_by_underlying_id[FED_FUNDS_RATE_UNDERLYING_ID]
+        rate_value: float = self.advance_rate(current_rate_value)
+        rate_change: float = round(rate_value - current_rate_value, 2)
+        sector_shock: float = random.gauss(mu=0.0, sigma=self.sector_std_dev)
+        return {
+            FED_FUNDS_RATE_UNDERLYING_ID: rate_value,
+            AJARAI_UNDERLYING_ID: self.advance_company_value(
+                value_by_underlying_id[AJARAI_UNDERLYING_ID],
+                rate_change,
+                sector_shock,
+                drift=self.ajarai_drift,
+                rate_beta=self.ajarai_rate_beta,
+                sector_beta=self.ajarai_sector_beta,
+                idio_std_dev=self.ajarai_idio_std_dev,
+            ),
+            THERIODIC_UNDERLYING_ID: self.advance_company_value(
+                value_by_underlying_id[THERIODIC_UNDERLYING_ID],
+                rate_change,
+                sector_shock,
+                drift=self.theriodic_drift,
+                rate_beta=self.theriodic_rate_beta,
+                sector_beta=self.theriodic_sector_beta,
+                idio_std_dev=self.theriodic_idio_std_dev,
+            ),
+        }
+
+    def next_rate_value(self, rate_value: float, num_grid_steps: int) -> float:
+        return max(round(rate_value + num_grid_steps * self.rate_step, 2), 0.0)
+
+    def tilted_rate_probabilities(self, rate_value: float) -> tuple[float, float]:
+        tilt: float = self.rate_reversion_strength * (self.rate_target - rate_value)
+        up_probability: float = min(max(self.rate_up_probability + tilt, 0.0), 1.0)
+        down_probability: float = min(max(self.rate_down_probability - tilt, 0.0), 1.0 - up_probability)
+        return up_probability, down_probability
+
+
+@dataclass(frozen=True)
+class OptionLeg:
+    underlying_id: int
+    weight: float
+
+
+class OrderType(StrEnum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class Position:
+    def __init__(self) -> None:
+        self.option_quantity_by_option_id: dict[int, int] = defaultdict(int)
+
+    def add_option_quantity(self, option_id: int, quantity: int) -> None:
+        self.option_quantity_by_option_id[option_id] += quantity
+
+
+@dataclass(frozen=True)
+class Quote:
+    bid_price: float
+    bid_quantity: int
+    offer_price: float
+    offer_quantity: int
+
+    def __post_init__(self) -> None:
+        if self.bid_quantity <= 0 or self.offer_quantity <= 0:
+            raise ValueError("Quote quantities must be positive")
+
+        if not (0.0 <= self.bid_price <= 1.0 and 0.0 <= self.offer_price <= 1.0):
+            raise ValueError("Quote prices must be between 0 and 1")
+
+        if self.bid_price >= self.offer_price:
+            raise ValueError("Quote bid price must be less than offer price")
+
+        if any(abs(round(price * 100) - price * 100) > 1e-6 for price in (self.bid_price, self.offer_price)):
+            raise ValueError("Quote prices must be in whole pennies (multiples of 0.01)")
+
+
+@dataclass(frozen=True)
+class Underlying:
+    name: str
+    underlying_id: int
+    value: float
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Underlying):
+            return False
+        return self.underlying_id == other.underlying_id
+
+
+# ============================================================================
+# STATISTICAL HELPERS
+# ============================================================================
+
+
+def _weighted_ols(
+    xs: list[float], ys: list[float], weights: list[float]
+) -> tuple[float, float]:
+    total_weight: float = sum(weights)
+    if total_weight <= 0:
+        return 0.0, (sum(ys) / len(ys) if ys else 0.0)
+
+    mean_x: float = sum(w * x for w, x in zip(weights, xs)) / total_weight
+    mean_y: float = sum(w * y for w, y in zip(weights, ys)) / total_weight
+
+    numerator: float = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(weights, xs, ys))
+    denominator: float = sum(w * (x - mean_x) ** 2 for w, x in zip(weights, xs))
+
+    if denominator == 0:
+        return 0.0, mean_y
+
+    slope: float = numerator / denominator
+    intercept: float = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _sample_covariance(xs: list[float], ys: list[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    mean_x, mean_y = _mean(xs), _mean(ys)
+    return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / (len(xs) - 1)
+
+
+def _sample_variance(xs: list[float]) -> float:
+    return _sample_covariance(xs, xs)
+
+
+# ============================================================================
+# MARKET MAKER
+# ============================================================================
+
+
+class MarketMaker:
+    _NUM_SIMULATION_PATHS: Final[int] = 2000
+    _POSITION_SKEW_PER_CONTRACT: Final[float] = 0.001
+    _MIN_TICK: Final[float] = 0.01
+
+    # Uncertainty padding parameters
+    _UNCERTAINTY_SCALE: Final[float] = 0.08
+    _UNCERTAINTY_MIN_DAYS: Final[int] = 10
+    _UNCERTAINTY_FLOOR: Final[float] = 0.003
+
+    # Cash and risk management parameters
+    _HEALTHY_THRESHOLD: Final[float] = 0.50
+    _MODERATE_THRESHOLD: Final[float] = 0.20
+    _MAX_QUOTE_SIZE: Final[int] = 30
+    _MAX_ABS_POSITION_PER_OPTION: Final[int] = 45
+
+    def __init__(
+        self,
+        underlying_initial_state: list[Underlying],
+        option_initial_state: list[BinaryOption],
+        cash_balance: float,
+    ) -> None:
+        self.underlying_state: list[Underlying] = underlying_initial_state
+        self.active_option_state: list[BinaryOption] = option_initial_state
+        self.cash_balance: float = cash_balance
+        self.position: Position = Position()
+        self.market_parameters: MarketParameters | None = None
+
+        self._available_cash: float = cash_balance
+        self._theo_cache: dict[BinaryOption, float] = {}
+        self._warm_up_num_days: int = 0
+
+    def on_step_advance(self, new_underlying_state: list[Underlying], new_option_state: list[BinaryOption]) -> None:
+        new_value_by_underlying_id: dict[int, float] = {
+            underlying.underlying_id: underlying.value for underlying in new_underlying_state
+        }
+        self._credit_expired_options(new_option_state, new_value_by_underlying_id)
+
+        self.underlying_state = new_underlying_state
+        self.active_option_state = new_option_state
+        self._theo_cache.clear()
+
+    def on_trade(self, option: BinaryOption, price: float, quantity: int, counterparty_id: int) -> None:
+        self.position.add_option_quantity(option.option_id, quantity)
+        self._apply_trade_cash_effect(price, quantity)
+
+    @property
+    def name(self) -> str:
+        return "Kai_Machamer_MM"
+
+    # ------------------------------------------------------------------
+    # Core Quoting And Order Response
+    # ------------------------------------------------------------------
+
+    def quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
+        theo: float = self.price_option(option)
+        current_position: int = self.position.option_quantity_by_option_id[option.option_id]
+        
+        skewed_mid: float = theo - self._POSITION_SKEW_PER_CONTRACT * current_position
+
+        variance: float = skewed_mid * (1.0 - skewed_mid)
+        variance_half_spread: float = 0.012 + (0.05 * variance)
+        half_spread: float = max(variance_half_spread, self._uncertainty_padding() * 0.6)
+
+        raw_bid_price: float = skewed_mid - half_spread
+        raw_offer_price: float = skewed_mid + half_spread
+
+        if abs(current_position) < 25:
+            raw_bid_price = min(raw_bid_price, theo - 0.005)
+            raw_offer_price = max(raw_offer_price, theo + 0.005)
+
+        target_total_spread: float = 2 * half_spread
+        if raw_offer_price > 1.0 - self._MIN_TICK:
+            raw_offer_price = 1.0 - self._MIN_TICK
+            raw_bid_price = raw_offer_price - target_total_spread
+        if raw_bid_price < self._MIN_TICK:
+            raw_bid_price = self._MIN_TICK
+            raw_offer_price = raw_bid_price + target_total_spread
+
+        bid_price: float = self._round_to_tick(raw_bid_price)
+        offer_price: float = self._round_to_tick(raw_offer_price)
+
+        bid_price = min(max(bid_price, self._MIN_TICK), 1.0 - self._MIN_TICK)
+        offer_price = min(max(offer_price, self._MIN_TICK), 1.0 - self._MIN_TICK)
+        if offer_price <= bid_price:
+            offer_price = min(bid_price + self._MIN_TICK, 1.0 - self._MIN_TICK)
+            bid_price = max(offer_price - self._MIN_TICK, self._MIN_TICK)
+
+        bid_quantity: int = self._affordable_quantity(price_if_wrong=bid_price, current_position=current_position)
+        offer_quantity: int = self._affordable_quantity(
+            price_if_wrong=1.0 - offer_price, current_position=current_position
+        )
+
+        return Quote(
+            bid_price=bid_price,
+            bid_quantity=bid_quantity,
+            offer_price=offer_price,
+            offer_quantity=offer_quantity,
+        )
+
+    def respond_to_fok(self, option: BinaryOption, fok_order: FokOrder) -> bool:
+        theo: float = self.price_option(option)
+        current_position: int = self.position.option_quantity_by_option_id[option.option_id]
+
+        variance: float = theo * (1.0 - theo)
+        edge_threshold: float = 0.01 + (0.04 * variance)
+
+        if abs(current_position) + fok_order.quantity > self._MAX_ABS_POSITION_PER_OPTION:
+            return False
+
+        if fok_order.order_type == OrderType.BUY:
+            max_loss: float = fok_order.quantity * (1.0 - fok_order.price)
+            if max_loss > self._risk_budget():
+                return False
+            return fok_order.price >= theo + edge_threshold
+
+        max_loss = fok_order.quantity * fok_order.price
+        if max_loss > self._risk_budget():
+            return False
+        return fok_order.price <= theo - edge_threshold
+        
+    # ------------------------------------------------------------------
+    # Pricing Engine
+    # ------------------------------------------------------------------
+
+    def price_option(self, option: BinaryOption) -> float:
+        if option in self._theo_cache:
+            return self._theo_cache[option]
+
+        if self.market_parameters is None:
+            return 0.5
+
+        theo: float = self.price_option_from_parameters(self.market_parameters, option)
+        self._theo_cache[option] = theo
+        return theo
+
+    def price_option_from_parameters(self, market_parameters: MarketParameters, option: BinaryOption) -> float:
+        value_by_underlying_id: dict[int, float] = {
+            underlying.underlying_id: underlying.value for underlying in self.underlying_state
+        }
+
+        if option.steps_until_expiry == 0:
+            return option.expiry_valuation(value_by_underlying_id)
+
+        if len(option.legs) == 1:
+            return self._price_single_leg_exact(market_parameters, option, value_by_underlying_id)
+
+        if len(option.legs) == 2 and {leg.underlying_id for leg in option.legs} == {
+            AJARAI_UNDERLYING_ID,
+            THERIODIC_UNDERLYING_ID,
+        }:
+            return self._price_two_company_spread(market_parameters, option, value_by_underlying_id)
+
+        return self._price_via_simulation(market_parameters, option, value_by_underlying_id)
+
+    def _price_via_simulation(
+        self, market_parameters: MarketParameters, option: BinaryOption, value_by_underlying_id: dict[int, float]
+    ) -> float:
+        num_in_the_money: int = 0
+        for _ in range(self._NUM_SIMULATION_PATHS):
+            path_values: dict[int, float] = dict(value_by_underlying_id)
+            for _ in range(option.steps_until_expiry):
+                path_values = market_parameters.advance_step(path_values)
+            num_in_the_money += int(option.expiry_valuation(path_values))
+
+        return num_in_the_money / self._NUM_SIMULATION_PATHS
+
+    def _rate_distribution(
+        self, market_parameters: MarketParameters, start_rate: float, steps: int
+    ) -> dict[float, float]:
+        distribution: dict[float, float] = {round(start_rate, 2): 1.0}
+        for _ in range(steps):
+            next_distribution: dict[float, float] = defaultdict(float)
+            for rate_value, probability in distribution.items():
+                up_probability, down_probability = market_parameters.tilted_rate_probabilities(rate_value)
+                flat_probability: float = 1.0 - up_probability - down_probability
+
+                if up_probability > 0:
+                    next_rate: float = market_parameters.next_rate_value(rate_value, 1)
+                    next_distribution[next_rate] += probability * up_probability
+                if down_probability > 0:
+                    next_rate = market_parameters.next_rate_value(rate_value, -1)
+                    next_distribution[next_rate] += probability * down_probability
+                if flat_probability > 0:
+                    next_distribution[rate_value] += probability * flat_probability
+
+            distribution = dict(next_distribution)
+        return distribution
+
+    def _company_parameters(
+        self, market_parameters: MarketParameters, underlying_id: int
+    ) -> tuple[float, float, float, float]:
+        if underlying_id == AJARAI_UNDERLYING_ID:
+            return (
+                market_parameters.ajarai_drift,
+                market_parameters.ajarai_rate_beta,
+                market_parameters.ajarai_sector_beta,
+                market_parameters.ajarai_idio_std_dev,
+            )
+        return (
+            market_parameters.theriodic_drift,
+            market_parameters.theriodic_rate_beta,
+            market_parameters.theriodic_sector_beta,
+            market_parameters.theriodic_idio_std_dev,
+        )
+
+    def _log_return_moments(
+        self,
+        market_parameters: MarketParameters,
+        underlying_id: int,
+        steps: int,
+        total_rate_change: float,
+    ) -> tuple[float, float]:
+        drift, rate_beta, sector_beta, idio_std_dev = self._company_parameters(market_parameters, underlying_id)
+        mean: float = steps * drift + rate_beta * total_rate_change
+        variance: float = steps * (sector_beta**2 * market_parameters.sector_std_dev**2 + idio_std_dev**2)
+        return mean, variance
+
+    def _price_single_leg_exact(
+        self, market_parameters: MarketParameters, option: BinaryOption, value_by_underlying_id: dict[int, float]
+    ) -> float:
+        leg: OptionLeg = option.legs[0]
+        start_rate: float = value_by_underlying_id[FED_FUNDS_RATE_UNDERLYING_ID]
+        rate_distribution: dict[float, float] = self._rate_distribution(
+            market_parameters, start_rate, option.steps_until_expiry
+        )
+
+        if leg.underlying_id == FED_FUNDS_RATE_UNDERLYING_ID:
+            return sum(
+                probability
+                for rate_value, probability in rate_distribution.items()
+                if leg.weight * rate_value >= option.strike
+            )
+
+        start_value: float = value_by_underlying_id[leg.underlying_id]
+        total_probability: float = 0.0
+        for rate_value, rate_probability in rate_distribution.items():
+            mean, variance = self._log_return_moments(
+                market_parameters, leg.underlying_id, option.steps_until_expiry, rate_value - start_rate
+            )
+            total_probability += rate_probability * self._probability_weighted_leg_condition(
+                leg.weight, start_value, option.strike, mean, variance
+            )
+        return total_probability
+
+    def _probability_weighted_leg_condition(
+        self, weight: float, start_value: float, strike: float, mean_log_return: float, variance_log_return: float
+    ) -> float:
+        std: float = math.sqrt(variance_log_return) if variance_log_return > 0 else 0.0
+        threshold: float = strike / (weight * start_value)
+
+        if weight > 0:
+            if threshold <= 0:
+                return 1.0
+            log_threshold: float = math.log(threshold)
+            if std == 0:
+                return 1.0 if mean_log_return >= log_threshold else 0.0
+            return 1.0 - self._standard_normal_cdf((log_threshold - mean_log_return) / std)
+
+        if threshold <= 0:
+            return 0.0
+        log_threshold = math.log(threshold)
+        if std == 0:
+            return 1.0 if mean_log_return <= log_threshold else 0.0
+        return self._standard_normal_cdf((log_threshold - mean_log_return) / std)
+
+    def _price_two_company_spread(
+        self, market_parameters: MarketParameters, option: BinaryOption, value_by_underlying_id: dict[int, float]
+    ) -> float:
+        weight_by_id: dict[int, float] = {leg.underlying_id: leg.weight for leg in option.legs}
+        ajarai_weight: float = weight_by_id[AJARAI_UNDERLYING_ID]
+        theriodic_weight: float = weight_by_id[THERIODIC_UNDERLYING_ID]
+
+        start_rate: float = value_by_underlying_id[FED_FUNDS_RATE_UNDERLYING_ID]
+        start_ajarai: float = value_by_underlying_id[AJARAI_UNDERLYING_ID]
+        start_theriodic: float = value_by_underlying_id[THERIODIC_UNDERLYING_ID]
+        steps: int = option.steps_until_expiry
+
+        _, ajarai_rate_beta, ajarai_sector_beta, ajarai_idio_std_dev = self._company_parameters(
+            market_parameters, AJARAI_UNDERLYING_ID
+        )
+        _, theriodic_rate_beta, theriodic_sector_beta, theriodic_idio_std_dev = self._company_parameters(
+            market_parameters, THERIODIC_UNDERLYING_ID
+        )
+        sector_variance: float = market_parameters.sector_std_dev**2
+
+        rate_distribution: dict[float, float] = self._rate_distribution(market_parameters, start_rate, steps)
+
+        total_samples: Final[int] = 20000
+        min_samples_per_branch: Final[int] = 50
+
+        rng: random.Random = random.Random(
+            hash((option, start_rate, start_ajarai, start_theriodic))
+        )
+
+        total_in_the_money: float = 0.0
+        for rate_value, rate_probability in rate_distribution.items():
+            samples_for_branch: int = max(min_samples_per_branch, round(total_samples * rate_probability))
+            total_rate_change: float = rate_value - start_rate
+
+            ajarai_mean, _ = self._log_return_moments(
+                market_parameters, AJARAI_UNDERLYING_ID, steps, total_rate_change
+            )
+            theriodic_mean, _ = self._log_return_moments(
+                market_parameters, THERIODIC_UNDERLYING_ID, steps, total_rate_change
+            )
+            sector_std: float = math.sqrt(steps * sector_variance)
+            ajarai_idio_std: float = math.sqrt(steps) * ajarai_idio_std_dev
+            theriodic_idio_std: float = math.sqrt(steps) * theriodic_idio_std_dev
+
+            branch_hits: int = 0
+            for _ in range(samples_for_branch):
+                sector_shock: float = rng.gauss(0.0, sector_std)
+                ajarai_log_return: float = (
+                    ajarai_mean + ajarai_sector_beta * sector_shock + rng.gauss(0.0, ajarai_idio_std)
+                )
+                theriodic_log_return: float = (
+                    theriodic_mean + theriodic_sector_beta * sector_shock + rng.gauss(0.0, theriodic_idio_std)
+                )
+                ajarai_value: float = start_ajarai * math.exp(ajarai_log_return)
+                theriodic_value: float = start_theriodic * math.exp(theriodic_log_return)
+                observable: float = ajarai_weight * ajarai_value + theriodic_weight * theriodic_value
+                if observable >= option.strike:
+                    branch_hits += 1
+
+            total_in_the_money += rate_probability * (branch_hits / samples_for_branch)
+
+        return total_in_the_money
+
+    @staticmethod
+    def _standard_normal_cdf(z: float) -> float:
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    # ------------------------------------------------------------------
+    # Warm-up And Parameter Estimation
+    # ------------------------------------------------------------------
+
+    def warm_up(self, market_history: MarketHistory) -> None:
+        self._theo_cache.clear()
+        self._warm_up_num_days = market_history.num_days
+
+        rate_values: tuple[float, ...] = market_history.values_by_underlying_id[FED_FUNDS_RATE_UNDERLYING_ID]
+        ajarai_values: tuple[float, ...] = market_history.values_by_underlying_id[AJARAI_UNDERLYING_ID]
+        theriodic_values: tuple[float, ...] = market_history.values_by_underlying_id[THERIODIC_UNDERLYING_ID]
+
+        rate_step, up_probability, down_probability, reversion_strength = self._fit_rate_dynamics(rate_values)
+
+        rate_changes: list[float] = [
+            round(rate_values[i + 1] - rate_values[i], 2) for i in range(len(rate_values) - 1)
+        ]
+
+        ajarai_log_returns: list[float] = self._log_returns(ajarai_values)
+        theriodic_log_returns: list[float] = self._log_returns(theriodic_values)
+
+        ajarai_drift, ajarai_rate_beta, ajarai_residuals = self._fit_company_regression(
+            rate_changes, ajarai_log_returns
+        )
+        theriodic_drift, theriodic_rate_beta, theriodic_residuals = self._fit_company_regression(
+            rate_changes, theriodic_log_returns
+        )
+
+        (
+            sector_std_dev,
+            ajarai_sector_beta,
+            theriodic_sector_beta,
+            ajarai_idio_std_dev,
+            theriodic_idio_std_dev,
+        ) = self._fit_sector_factor(ajarai_residuals, theriodic_residuals)
+
+        self.market_parameters = MarketParameters(
+            ajarai_drift=ajarai_drift,
+            ajarai_idio_std_dev=ajarai_idio_std_dev,
+            ajarai_rate_beta=ajarai_rate_beta,
+            ajarai_sector_beta=ajarai_sector_beta,
+            rate_down_probability=down_probability,
+            rate_reversion_strength=reversion_strength,
+            rate_up_probability=up_probability,
+            sector_std_dev=sector_std_dev,
+            theriodic_drift=theriodic_drift,
+            theriodic_idio_std_dev=theriodic_idio_std_dev,
+            theriodic_rate_beta=theriodic_rate_beta,
+            theriodic_sector_beta=theriodic_sector_beta,
+            rate_step=rate_step,
+        )
+
+    def _fit_rate_dynamics(self, rate_values: tuple[float, ...]) -> tuple[float, float, float, float]:
+        diffs: list[float] = [
+            round(rate_values[i + 1] - rate_values[i], 2)
+            for i in range(len(rate_values) - 1)
+            if rate_values[i + 1] != rate_values[i]
+        ]
+        nonzero_abs_diffs: list[float] = [abs(diff) for diff in diffs if diff != 0]
+        rate_step: float = min(nonzero_abs_diffs) if nonzero_abs_diffs else RATE_STRIKE_GRID
+
+        up_by_level: dict[float, list[float]] = defaultdict(list)
+        down_by_level: dict[float, list[float]] = defaultdict(list)
+        for i in range(len(rate_values) - 1):
+            level: float = round(rate_values[i], 2)
+            diff: float = round(rate_values[i + 1] - rate_values[i], 2)
+            step: int = round(diff / rate_step) if rate_step else 0
+            up_by_level[level].append(1.0 if step > 0 else 0.0)
+            down_by_level[level].append(1.0 if step < 0 else 0.0)
+
+        assumed_rate_target_for_window: float = 2.0
+        window_radius: float = 1 * rate_step
+        levels: list[float] = sorted(
+            level
+            for level in up_by_level
+            if abs(level - assumed_rate_target_for_window) <= window_radius
+        )
+        if not levels:
+            levels = sorted(up_by_level.keys())
+        up_freqs: list[float] = [_mean(up_by_level[level]) for level in levels]
+        down_freqs: list[float] = [_mean(down_by_level[level]) for level in levels]
+        weights: list[float] = [float(len(up_by_level[level])) for level in levels]
+
+        slope_up, intercept_up = _weighted_ols(levels, up_freqs, weights)
+        slope_down, intercept_down = _weighted_ols(levels, down_freqs, weights)
+
+        reversion_strength: float = min(max((slope_down - slope_up) / 2, 0.0), 1.0)
+        assumed_rate_target: float = 2.0
+
+        up_probability: float = slope_up * assumed_rate_target + intercept_up
+        down_probability: float = slope_down * assumed_rate_target + intercept_down
+
+        up_probability = min(max(up_probability, 0.01), 0.9)
+        down_probability = min(max(down_probability, 0.01), 0.9)
+        if up_probability + down_probability > 0.99:
+            scale: float = 0.99 / (up_probability + down_probability)
+            up_probability *= scale
+            down_probability *= scale
+
+        return rate_step, up_probability, down_probability, reversion_strength
+
+    def _log_returns(self, values: tuple[float, ...]) -> list[float]:
+        return [math.log(values[i + 1] / values[i]) for i in range(len(values) - 1)]
+
+    def _fit_company_regression(
+        self, rate_changes: list[float], log_returns: list[float]
+    ) -> tuple[float, float, list[float]]:
+        weights: list[float] = [1.0] * len(rate_changes)
+        rate_beta, drift = _weighted_ols(rate_changes, log_returns, weights)
+        residuals: list[float] = [
+            log_return - drift - rate_beta * rate_change
+            for rate_change, log_return in zip(rate_changes, log_returns)
+        ]
+        return drift, rate_beta, residuals
+
+    def _fit_sector_factor(
+        self, ajarai_residuals: list[float], theriodic_residuals: list[float]
+    ) -> tuple[float, float, float, float, float]:
+        ajarai_var: float = _sample_variance(ajarai_residuals)
+        theriodic_var: float = _sample_variance(theriodic_residuals)
+        covariance: float = _sample_covariance(ajarai_residuals, theriodic_residuals)
+
+        sector_std_dev: float = 1.0
+        sign: float = 1.0 if covariance >= 0 else -1.0
+        shared_beta_magnitude: float = math.sqrt(abs(covariance)) if covariance != 0 else 0.0
+
+        ajarai_sector_beta: float = shared_beta_magnitude
+        theriodic_sector_beta: float = sign * shared_beta_magnitude
+
+        ajarai_idio_variance: float = max(ajarai_var - ajarai_sector_beta**2 * sector_std_dev**2, 1e-8)
+        theriodic_idio_variance: float = max(theriodic_var - theriodic_sector_beta**2 * sector_std_dev**2, 1e-8)
+
+        return (
+            sector_std_dev,
+            ajarai_sector_beta,
+            theriodic_sector_beta,
+            math.sqrt(ajarai_idio_variance),
+            math.sqrt(theriodic_idio_variance),
+        )
+
+    # ------------------------------------------------------------------
+    # Cash And Position Risk Management
+    # ------------------------------------------------------------------
+
+    def _apply_trade_cash_effect(self, price: float, quantity: int) -> None:
+        if quantity > 0:
+            self._available_cash -= quantity * price
+        else:
+            self._available_cash -= abs(quantity) * (1.0 - price)
+
+    def _credit_expired_options(
+        self, new_option_state: list[BinaryOption], new_value_by_underlying_id: dict[int, float]
+    ) -> None:
+        old_option_by_id: dict[int, BinaryOption] = {
+            option.option_id: option for option in self.active_option_state
+        }
+        still_active_ids: set[int] = {option.option_id for option in new_option_state}
+        expired_ids: set[int] = set(old_option_by_id.keys()) - still_active_ids
+
+        for option_id in expired_ids:
+            position_quantity: int = self.position.option_quantity_by_option_id.get(option_id, 0)
+            if position_quantity == 0:
+                continue
+
+            expired_option: BinaryOption = old_option_by_id[option_id]
+            outcome: float = expired_option.expiry_valuation(new_value_by_underlying_id)
+
+            if position_quantity > 0:
+                self._available_cash += position_quantity * outcome
+            else:
+                self._available_cash += abs(position_quantity) * (1.0 - outcome)
+
+    def _uncertainty_padding(self) -> float:
+        effective_days: int = max(self._warm_up_num_days, self._UNCERTAINTY_MIN_DAYS)
+        return max(self._UNCERTAINTY_SCALE / math.sqrt(effective_days), self._UNCERTAINTY_FLOOR)
+
+    def _risk_budget(self) -> float:
+        if self.cash_balance <= 0 or self._available_cash <= 0:
+            return 0.0
+
+        health: float = self._available_cash / self.cash_balance
+        if health > self._HEALTHY_THRESHOLD:
+            fraction: float = 0.3
+        elif health > self._MODERATE_THRESHOLD:
+            fraction = 0.2
+        else:
+            fraction = 0.1
+
+        return self._available_cash * fraction
+
+    def _affordable_quantity(self, price_if_wrong: float, current_position: int) -> int:
+        room: int = self._MAX_ABS_POSITION_PER_OPTION - abs(current_position)
+        if room <= 0:
+            return 1
+
+        budget: float = self._risk_budget()
+        per_contract_loss: float = max(price_if_wrong, self._MIN_TICK)
+        affordable: int = int(budget // per_contract_loss)
+
+        return max(1, min(affordable, self._MAX_QUOTE_SIZE, room))
+        
+    def _round_to_tick(self, price: float) -> float:
+        return round(round(price / self._MIN_TICK) * self._MIN_TICK, 2)
